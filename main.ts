@@ -1,228 +1,208 @@
-// gta6-twitch-ccu-forecast-01 entry V07: aligned-jump kernel (spread x0.75)
-// blended with a local-linear median.
-//
-// Idea: launch-day Twitch curves share a shape, but each game's morning
-// jump lands on a different hour. Part A aligns every comparable launch
-// curve so its biggest morning jump (hours 4..10) sits at hour 5, then
-// takes a Gaussian-kernel weighted quantile (bandwidth 0.5 in log space,
-// weight by closeness of the aligned hour-1 print to this case's hour-1
-// print) of the aligned log-ratios, with the spread shrunk by 0.75.
-// Part B is a per-hour local-linear regression of ln(viewers_h) on
-// ln(viewers_1) over the unaligned curves. The final median is the
-// geometric mean of the two medians; the final spread is Part A's
-// (already shrunk) spread around that median.
-//
-// Node 22, standard library only, no network, deterministic.
-
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+// GTA6 Twitch CCU forecast — V19: aligned-jump kernel + local-linear blend,
+// with the local-linear weight chosen by the size of the hour-1 print.
+// Reads one case file per run from MAKEFUN_INPUT_DIR (else /input) and writes
+// one <id>.out per case to MAKEFUN_OUTPUT_DIR (else /output).
+// Only the case file's own data is used; standard library only; deterministic.
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
-const HOURS = Array.from({ length: 23 }, (_, i) => i + 2); // 2..24
-const SIGMA_KERNEL = 0.5; // Gaussian kernel bandwidth in log space
-const SPREAD_SHRINK = 0.75; // Part A spread multiplier
-const MAX_VIEWERS = 1e9;
+const BANDWIDTH = 0.5;
+const SPREAD_SHRINK = 0.75;
+const CLAMP_LOG = 2.0;
+const SMALL_P1 = 50000;
+const LARGE_P1 = 200000;
+const MAX_Q = 1e9;
 
-interface HourlyRow {
-  from: string;
-  viewers: number;
+function medianOf(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  const n = s.length;
+  if (n === 0) return 0;
+  const mid = Math.floor(n / 2);
+  return n % 2 === 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
-interface Comparable {
-  day_start: string;
-  hourly: HourlyRow[];
-}
-
-interface Case {
-  known: Array<{ hour: number; viewers: number }>;
-  forecast: Array<{ hour: number }>;
-  comparables: Comparable[];
-}
-
-const round2 = (x: number): number => Math.round(x * 100) / 100;
-
-const clampPositive = (x: number): number => {
-  if (!Number.isFinite(x) || x <= 0) return 1;
-  return Math.min(x, MAX_VIEWERS);
-};
-
-/** Weighted quantile of values with weights (both same length, sorted by value). */
+// Weighted empirical quantile: smallest value whose cumulative weight
+// reaches tau of the total weight. Inputs must be sorted by value.
 function weightedQuantile(pairs: Array<[number, number]>, tau: number): number {
-  const sorted = pairs.slice().sort((a, b) => a[0] - b[0]);
   let total = 0;
-  for (const [, w] of sorted) total += w;
-  if (total <= 0 || sorted.length === 0) return sorted.length ? sorted[0][0] : 0;
+  for (const [, w] of pairs) total += w;
+  if (total <= 0 || pairs.length === 0) return pairs.length ? pairs[0][0] : 0;
   const target = tau * total;
-  let cum = 0;
-  for (const [v, w] of sorted) {
-    cum += w;
-    if (cum >= target) return v;
+  let acc = 0;
+  for (const [v, w] of pairs) {
+    acc += w;
+    if (acc >= target) return v;
   }
-  return sorted[sorted.length - 1][0];
+  return pairs[pairs.length - 1][0];
 }
 
-/** Release-day curve of one comparable: hour (1..24) -> viewers (>0 only). */
-function releaseCurve(comp: Comparable): Map<number, number> {
-  const start = Date.parse(comp.day_start);
-  const curve = new Map<number, number>();
-  if (!Number.isFinite(start)) return curve;
+interface Curve {
+  // log viewers for release-day hours 1..24, original (unaligned) timeline.
+  logV: number[];
+  // log viewers on the aligned timeline (jump moved to hour 5); null where
+  // the shift pushes the hour outside 1..24.
+  alignedLogV: Array<number | null>;
+  logV1: number;
+}
+
+function extractCurve(comp: any): Curve | null {
+  const dayStart = Date.parse(comp.day_start);
+  if (!Number.isFinite(dayStart)) return null;
+  const logV: Array<number | null> = new Array(24).fill(null);
   for (const row of comp.hourly ?? []) {
     const t = Date.parse(row.from);
     if (!Number.isFinite(t)) continue;
-    const h = Math.round((t - start) / 3_600_000) + 1;
+    const h = Math.floor((t - dayStart) / 3600000) + 1;
     if (h < 1 || h > 24) continue;
-    const v = Number(row.viewers);
-    if (Number.isFinite(v) && v > 0) curve.set(h, v);
+    const v = Math.max(1, Number(row.viewers) || 1);
+    logV[h - 1] = Math.log(v);
   }
-  return curve;
-}
-
-/** Hour of the biggest morning jump (hours 4..10), default 5. */
-function jumpHour(curve: Map<number, number>): number {
-  let bestHour = 5;
-  let bestJump = -Infinity;
+  if (logV.some((x) => x === null)) return null;
+  const vals = logV as number[];
+  // Morning jump: hour h in 4..10 with the largest log hour-to-hour rise.
+  let jumpHour = 5;
+  let bestRise = -Infinity;
   for (let h = 4; h <= 10; h++) {
-    const prev = curve.get(h - 1);
-    const cur = curve.get(h);
-    if (prev === undefined || cur === undefined || prev <= 0 || cur <= 0) continue;
-    const jump = Math.log(cur / prev);
-    if (jump > bestJump) {
-      bestJump = jump;
-      bestHour = h;
+    const rise = vals[h - 1] - vals[h - 2];
+    if (rise > bestRise) {
+      bestRise = rise;
+      jumpHour = h;
     }
   }
-  return bestHour;
+  const shift = 5 - jumpHour;
+  const alignedLogV: Array<number | null> = new Array(24).fill(null);
+  for (let h = 1; h <= 24; h++) {
+    const src = h - shift;
+    if (src >= 1 && src <= 24) alignedLogV[h - 1] = vals[src - 1];
+  }
+  return { logV: vals, alignedLogV, logV1: vals[0] };
 }
 
-function forecastCase(c: Case): Array<{ hour: number; q: number[] }> {
-  const first = c.known.find((k) => k.hour === 1);
-  if (first === undefined) throw new Error('case has no hour-1 print');
-  const p1 = Math.max(1, first.viewers);
-  const lnP1 = Math.log(p1);
-
-  // Keep comparables with an hour-1 print and >= 12 hours of release-day data.
-  interface Prepared {
-    curve: Map<number, number>; // unaligned release-day curve
-    aligned: Map<number, number>; // jump-aligned curve
-    v1Aligned: number;
-    weight: number;
+function localLinearMedian(
+  curves: Curve[],
+  hour: number,
+  logP1: number,
+): number {
+  // OLS of ln(v_h) on ln(v1) across all comparables (unaligned timeline).
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const c of curves) {
+    xs.push(c.logV1);
+    ys.push(c.logV[hour - 1]);
   }
-  const comps: Prepared[] = [];
-  for (const comp of c.comparables ?? []) {
-    const curve = releaseCurve(comp);
-    if (!curve.has(1) || curve.size < 12) continue;
-    const shift = 5 - jumpHour(curve);
-    const aligned = new Map<number, number>();
-    for (const [h, v] of curve) {
-      const ha = h + shift;
-      if (ha >= 1 && ha <= 24 && !aligned.has(ha)) aligned.set(ha, v);
-    }
-    const v1a = aligned.get(1);
-    if (v1a === undefined || v1a <= 0) continue;
-    const d = lnP1 - Math.log(v1a);
-    const weight = Math.exp(-(d * d) / (2 * SIGMA_KERNEL * SIGMA_KERNEL));
-    comps.push({ curve, aligned, v1Aligned: v1a, weight });
+  const n = xs.length;
+  if (n === 0) return logP1;
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < n; i++) {
+    mx += xs[i];
+    my += ys[i];
+  }
+  mx /= n;
+  my /= n;
+  let sxx = 0;
+  let sxy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = xs[i] - mx;
+    sxx += dx * dx;
+    sxy += dx * (ys[i] - my);
+  }
+  const slope = sxx > 1e-12 ? sxy / sxx : 0;
+  const intercept = my - slope * mx;
+  return intercept + slope * logP1;
+}
+
+function forecastCase(caseData: any): { hours: Array<{ hour: number; q: number[] }> } {
+  const p1 = Math.max(1, Number(caseData.known?.[0]?.viewers) || 1);
+  const logP1 = Math.log(p1);
+  const curves: Curve[] = [];
+  for (const comp of caseData.comparables ?? []) {
+    const c = extractCurve(comp);
+    if (c) curves.push(c);
   }
 
-  const rows: Array<{ hour: number; q: number[] }> = [];
-  for (const h of HOURS) {
-    // ---- Part A: kernel-weighted quantiles of aligned log-ratios ----
-    let qA: number[] = [];
+  // Size-adaptive local-linear weight.
+  const wL = p1 < SMALL_P1 ? 0.75 : p1 < LARGE_P1 ? 0.5 : 0.35;
+
+  const hours: Array<{ hour: number; q: number[] }> = [];
+  for (let h = 2; h <= 24; h++) {
+    // (a) Aligned-jump kernel: Gaussian weights on ln p1 vs ln v1_c
+    // (original hour-1), empirical quantiles of the log-ratios taken
+    // INSIDE the aligned curve, r = ln(aligned v_h / aligned v1).
+    // A comparable whose aligned hour-1 falls outside 1..24 has no
+    // aligned anchor and is left out of the kernel for every hour.
     const pairs: Array<[number, number]> = [];
-    for (const comp of comps) {
-      const v = comp.aligned.get(h);
-      if (v !== undefined && v > 0) pairs.push([Math.log(v / comp.v1Aligned), comp.weight]);
+    for (const c of curves) {
+      const av = c.alignedLogV[h - 1];
+      const a1 = c.alignedLogV[0];
+      if (av === null || a1 === null) continue;
+      const d = logP1 - c.logV1;
+      const w = Math.exp(-(d * d) / (2 * BANDWIDTH * BANDWIDTH));
+      pairs.push([av - a1, w]);
     }
-    if (pairs.length > 0) {
-      qA = LEVELS.map((tau) => p1 * Math.exp(weightedQuantile(pairs, tau)));
+    pairs.sort((a, b) => a[0] - b[0]);
+
+    let logQuantiles: number[];
+    let kernelLogMedian: number;
+    if (pairs.length === 0) {
+      // No comparable covers this hour: fall back to persistence.
+      kernelLogMedian = logP1;
+      logQuantiles = LEVELS.map(() => logP1);
     } else {
-      // No aligned observation for this hour: fall back to unaligned ratios.
-      const fallback: Array<[number, number]> = [];
-      for (const comp of comps) {
-        const v = comp.curve.get(h);
-        const v1 = comp.curve.get(1);
-        if (v !== undefined && v1 !== undefined && v > 0 && v1 > 0) {
-          fallback.push([Math.log(v / v1), comp.weight]);
-        }
-      }
-      qA = fallback.length > 0
-        ? LEVELS.map((tau) => p1 * Math.exp(weightedQuantile(fallback, tau)))
-        : LEVELS.map(() => p1);
+      const ratioQs = LEVELS.map((tau) => weightedQuantile(pairs, tau));
+      // Convert the kernel median from log-ratio to log-level BEFORE
+      // clamping / blending: log-level median = ln p1 + log-ratio median.
+      kernelLogMedian = logP1 + ratioQs[2];
+      // Kernel quantiles in log-level, spread shrunk x0.75 toward median.
+      logQuantiles = ratioQs.map(
+        (rq) => kernelLogMedian + SPREAD_SHRINK * (logP1 + rq - kernelLogMedian),
+      );
     }
-    const medianA = qA[2];
-    // Narrow the spread by 0.75 around the median.
-    const qAShrunk = qA.map((q) => medianA * Math.exp(Math.log(clampPositive(q) / medianA) * SPREAD_SHRINK));
 
-    // ---- Part B: per-hour OLS of ln(v_h) on ln(v1), unaligned ----
-    let medianB = medianA;
-    const xs: number[] = [];
-    const ys: number[] = [];
-    for (const comp of comps) {
-      const v1 = comp.curve.get(1);
-      const v = comp.curve.get(h);
-      if (v1 !== undefined && v !== undefined && v1 > 0 && v > 0) {
-        xs.push(Math.log(v1));
-        ys.push(Math.log(v));
-      }
-    }
-    if (xs.length >= 2) {
-      const n = xs.length;
-      const mx = xs.reduce((a, b) => a + b, 0) / n;
-      const my = ys.reduce((a, b) => a + b, 0) / n;
-      let sxx = 0;
-      let sxy = 0;
-      for (let i = 0; i < n; i++) {
-        sxx += (xs[i] - mx) * (xs[i] - mx);
-        sxy += (xs[i] - mx) * (ys[i] - my);
-      }
-      if (sxx > 1e-12) {
-        const b = sxy / sxx;
-        const a = my - b * mx;
-        const pred = a + b * lnP1;
-        if (Number.isFinite(pred)) medianB = Math.exp(pred);
-      } else {
-        // No spread in ln(v1): use the geometric mean ratio.
-        const meanLogRatio = ys.reduce((acc, y, i) => acc + (y - xs[i]), 0) / n;
-        medianB = p1 * Math.exp(meanLogRatio);
-      }
-    } else if (xs.length === 1) {
-      medianB = p1 * Math.exp(ys[0] - xs[0]);
-    }
-    medianB = clampPositive(medianB);
-    // Guard against extreme OLS extrapolation when p1 sits far outside
-    // the comparables' hour-1 range: keep the regression median within
-    // a factor exp(2) of the kernel median. On the practice cases p1 is
-    // inside the range, so this guard does not move any forecast there.
-    const logRatioB = Math.log(medianB / clampPositive(medianA));
-    if (logRatioB > 2) medianB = clampPositive(medianA) * Math.exp(2);
-    else if (logRatioB < -2) medianB = clampPositive(medianA) * Math.exp(-2);
+    // (b) Local-linear median, clamped within exp(+-2) of the kernel median.
+    let llLogMedian = localLinearMedian(curves, h, logP1);
+    llLogMedian = Math.max(
+      kernelLogMedian - CLAMP_LOG,
+      Math.min(kernelLogMedian + CLAMP_LOG, llLogMedian),
+    );
 
-    // ---- Combine: geometric-mean median, Part A (shrunk) spread ----
-    const medianFinal = Math.sqrt(clampPositive(medianA) * medianB);
-    const qs = qAShrunk.map((q) => medianFinal * Math.exp(Math.log(clampPositive(q) / medianA)));
-    // Enforce finite, positive, <= 1e9, non-decreasing, rounded to 2 decimals.
-    const clean: number[] = [];
-    let prev = 0;
-    for (const q of qs) {
-      let v = round2(clampPositive(q));
-      if (v < prev) v = prev;
-      if (v <= 0) v = prev > 0 ? prev : 1;
-      clean.push(v);
-      prev = v;
+    // Geometric blend in log space.
+    const finalLogMedian = (1 - wL) * kernelLogMedian + wL * llLogMedian;
+
+    // Spread from the kernel (shrunk), re-centred on the blended median.
+    const q = logQuantiles.map((lq) => {
+      const v = Math.exp(finalLogMedian + (lq - kernelLogMedian));
+      return Math.min(MAX_Q, Math.max(1, v));
+    });
+    // Enforce non-decreasing quantiles.
+    for (let i = 1; i < q.length; i++) {
+      if (q[i] < q[i - 1]) q[i] = q[i - 1];
     }
-    rows.push({ hour: h, q: clean });
+    hours.push({ hour: h, q });
   }
-  return rows;
+  return { hours };
 }
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
-const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
-for (const file of inputs) {
-  const id = file.slice(0, -'.in'.length);
-  const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
-  const hours = forecastCase(c);
-  writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ hours })}\n`);
+function main(): void {
+  const inputDir = process.env.MAKEFUN_INPUT_DIR ?? "/input";
+  const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+  fs.mkdirSync(outputDir, { recursive: true });
+  const files = fs
+    .readdirSync(inputDir)
+    .filter((f) => f.endsWith(".in"))
+    .sort();
+  for (const file of files) {
+    const caseData = JSON.parse(
+      fs.readFileSync(path.join(inputDir, file), "utf8"),
+    );
+    const out = forecastCase(caseData);
+    const id = String(caseData.id ?? file.replace(/\.in$/, ""));
+    fs.writeFileSync(
+      path.join(outputDir, `${id}.out`),
+      JSON.stringify(out),
+    );
+  }
 }
+
+main();
